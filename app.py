@@ -13,6 +13,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_classic.memory import ConversationSummaryBufferMemory
 from urllib.parse import urlparse, parse_qs
 import warnings
+os.environ["TRANSFORMERS_NO_TORCHVISION"] = "1"
 warnings.filterwarnings("ignore")
 import nltk
 nltk.download('punkt', quiet=True)
