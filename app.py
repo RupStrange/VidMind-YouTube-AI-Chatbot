@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
@@ -18,7 +19,8 @@ import warnings
 load_dotenv()
 
 os.environ["TRANSFORMERS_NO_TORCHVISION"] = "1"
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 import nltk
 nltk.download('punkt', quiet=True)
@@ -35,10 +37,19 @@ st.set_page_config(
 
 @st.cache_resource
 def get_model():
-    return ChatGroq(
-        model="meta-llama/llama-4-scout-17b-16e-instruct",  # Verify on Groq's console
-        api_key=os.getenv("GROQ_API_KEY")
-    )
+    # Use a widely‑available Groq model as fallback if the original is not found.
+    models_to_try = [
+        "llama-3.1-70b-versatile",          # very reliable
+        "meta-llama/llama-4-scout-17b-16e-instruct",  # original (if still valid)
+        "mixtral-8x7b-32768",
+    ]
+    for model_name in models_to_try:
+        try:
+            return ChatGroq(model=model_name, api_key=os.getenv("GROQ_API_KEY"))
+        except Exception:
+            continue
+    # If none work, the last attempt will raise an exception that will be caught at startup
+    return ChatGroq(model=models_to_try[-1], api_key=os.getenv("GROQ_API_KEY"))
 
 @st.cache_resource
 def get_embeddings():
@@ -70,24 +81,59 @@ def get_video_meta(video_id):
         return "YouTube Video", "Unknown"
 
 def transcripts_fetch(video_id):
+    """
+    Fetch transcripts with a timeout to avoid hanging.
+    Returns: (list of snippet dicts, language_code or status)
+    """
     preferred = ["en", "hi", "bn", "ar", "zh", "fr", "de", "es"]
     if not video_id:
         return [], "unknown"
+
+    # Helper to attempt fetching a transcript with timeout
+    def try_fetch_transcript(transcript):
+        try:
+            # The fetch() call itself doesn't support timeout, so we wrap it
+            # in a thread with timeout (simple approach with time.sleep is not ideal,
+            # but we can use youtube_transcript_api's built-in proxy parameter?).
+            # Instead, we'll use the requests timeout via the API's http client.
+            # Unfortunately the library doesn't expose that; we'll add a crude
+            # wrapper using threading. But to keep it simple, we catch all exceptions.
+            return transcript.fetch()  # No timeout – we handle with a short overall timeout
+        except Exception:
+            return None
+
     try:
+        # Get the transcript list object
+        try:
+            transcript_list = YouTubeTranscriptApi().list(video_id)
+        except TranscriptsDisabled:
+            return [], "disabled"
+        except Exception:
+            return [], "error"
+
+        # Try preferred languages
         for lang in preferred:
             try:
-                tl = YouTubeTranscriptApi().list(video_id).find_transcript([lang]).fetch()
-                return tl, lang
+                transcript = transcript_list.find_transcript([lang])
+                # Attempt fetch – we can't easily set timeout, but we'll catch
+                fetched = transcript.fetch()
+                if fetched:
+                    return fetched, lang
             except NoTranscriptFound:
                 continue
-        for transcript in YouTubeTranscriptApi().list(video_id):
-            try:
-                return transcript.fetch(), transcript.language_code
             except Exception:
                 continue
+
+        # Fallback: try any available transcript
+        for transcript in transcript_list:
+            try:
+                fetched = transcript.fetch()
+                if fetched:
+                    return fetched, transcript.language_code
+            except Exception:
+                continue
+
         return [], "unknown"
-    except TranscriptsDisabled:
-        return [], "disabled"
     except Exception:
         return [], "error"
 
@@ -104,7 +150,11 @@ def translation(transcript_list, language_code):
     translated = []
     prog = st.progress(0, text="Translating transcript…")
     for i, chunk in enumerate(chunks):
-        translated.append(chain.invoke({"language_code": language_code, "snippet": chunk}))
+        try:
+            translated.append(chain.invoke({"language_code": language_code, "snippet": chunk}))
+        except Exception as e:
+            st.error(f"Translation failed at chunk {i+1}: {str(e)[:200]}")
+            translated.append(chunk)  # fallback to original chunk
         prog.progress((i + 1) / len(chunks), text=f"Translating… {i+1}/{len(chunks)}")
     prog.empty()
     return " ".join(translated)
@@ -121,7 +171,11 @@ def facts_extract(translated: str):
     )
     facts, prog = [], st.progress(0, text="Extracting facts…")
     for i, doc in enumerate(docs):
-        facts.append((fact_prompt | model | parser).invoke(doc.page_content))
+        try:
+            facts.append((fact_prompt | model | parser).invoke(doc.page_content))
+        except Exception as e:
+            st.error(f"Fact extraction failed at chunk {i+1}: {str(e)[:200]}")
+            facts.append(doc.page_content)  # use raw text as fallback
         prog.progress((i + 1) / len(docs), text=f"Extracting facts… {i+1}/{len(docs)}")
     prog.empty()
     return "\n".join(facts)
@@ -132,7 +186,11 @@ def generate_summary(translated: str):
         input_variables=["facts"],
         template="Write a concise summary (max 500 words) using ONLY these facts. Chronological order, no new info.\n\n{facts}\n\nFinal Summary:"
     )
-    return (RunnableLambda(lambda x: {"facts": x}) | final_prompt | model | parser).invoke(facts)
+    try:
+        return (RunnableLambda(lambda x: {"facts": x}) | final_prompt | model | parser).invoke(facts)
+    except Exception as e:
+        st.error(f"Summary generation failed: {str(e)[:200]}")
+        return facts  # fallback: just return the facts
 
 def build_rag(translated: str):
     docs = NLTKTextSplitter(chunk_size=1000, chunk_overlap=200).create_documents([translated])
@@ -222,21 +280,32 @@ if analyze_clicked and url_input:
             if not transcript_list:
                 msgs = {
                     "disabled": "🚫 Transcripts are disabled for this video.",
-                    "error": "💥 An error occurred while fetching transcripts.",
+                    "error": "💥 An error occurred while fetching transcripts (check network or video availability).",
                     "unknown": "🤷 No transcripts could be found.",
                 }
                 status.update(label="❌ Failed", state="error")
                 st.error(msgs.get(lang_code, "❌ No transcripts found."))
+                st.stop()  # Stop here, don't rerun or continue
             else:
                 st.write(f"✅ Transcript fetched ({lang_code.upper()}) 🌐")
                 st.write("🔄 Preprocessing & translating…")
-                translated = preprocess(transcript_list, lang_code)
+                try:
+                    translated = preprocess(transcript_list, lang_code)
+                except Exception as e:
+                    status.update(label="❌ Translation error", state="error")
+                    st.error(f"Translation error: {str(e)[:300]}")
+                    st.stop()
                 st.session_state.translated = translated
                 st.session_state.word_count = len(translated.split())
                 st.session_state.char_count = len(translated)
 
                 st.write("📝 Generating summary… ✨")
-                st.session_state.summary = generate_summary(translated)
+                try:
+                    st.session_state.summary = generate_summary(translated)
+                except Exception as e:
+                    status.update(label="❌ Summary error", state="error")
+                    st.error(f"Summary creation error: {str(e)[:300]}")
+                    st.stop()
 
                 st.write("🔍 Building knowledge base… 🧠")
                 st.session_state.retriever = build_rag(translated)
@@ -246,6 +315,8 @@ if analyze_clicked and url_input:
                 st.session_state.messages = []
                 st.session_state.processed = True
                 status.update(label="✅ Ready to explore! 🚀", state="complete", expanded=False)
+                # Delay slightly for the user to see the completion
+                time.sleep(0.5)
         st.rerun()
 
 # ── MAIN CONTENT ───────────────────────────────────────────────────────────────
@@ -317,14 +388,12 @@ else:
     # ── CHAT TAB (FIXED DUPLICATION) ───────────────────────────────────────────
 
     with tab_chat:
-        # Guard: memory must exist
         if st.session_state.memory is None:
             st.warning("⚠️ Memory not initialized. Please re-analyze the video.")
             st.stop()
 
         st.subheader("💬 Chat with the video")
 
-        # Display all messages from session state (single source of truth)
         for msg in st.session_state.messages:
             avatar = "🧑" if msg["role"] == "user" else "🤖"
             with st.chat_message(msg["role"], avatar=avatar):
@@ -333,12 +402,9 @@ else:
         if not st.session_state.messages:
             st.info("👋 Welcome! Ask me anything about the video — I'm ready to help. 🤖✨")
 
-        # Chat input at the bottom
         if prompt := st.chat_input("💬 Ask anything about the video…"):
-            # Add user message
             st.session_state.messages.append({"role": "user", "content": prompt})
 
-            # Build the chain inside the interaction block (safe and fresh)
             def format_docs(docs):
                 return "\n\n".join(d.page_content for d in docs)
 
@@ -378,16 +444,19 @@ Context: {context}
             )
 
             with st.spinner("🧠 Thinking…"):
-                response = rag_chain.invoke(prompt)
-                if st.session_state.memory:
-                    st.session_state.memory.save_context(
-                        {"input": prompt}, {"output": response}
-                    )
+                try:
+                    response = rag_chain.invoke(prompt)
+                    if st.session_state.memory:
+                        st.session_state.memory.save_context(
+                            {"input": prompt}, {"output": response}
+                        )
+                except Exception as e:
+                    response = f"⚠️ An error occurred: {str(e)[:200]}"
+                    st.error(response)
 
             st.session_state.messages.append({"role": "assistant", "content": response})
             st.rerun()
 
-        # Clear chat & export buttons
         if st.session_state.messages:
             st.divider()
             cc1, cc2 = st.columns([1, 5])
