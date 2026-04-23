@@ -1,5 +1,5 @@
-streamlit
 python-dotenv
+streamlit
 langchain-core
 langchain-text-splitters
 langchain-huggingface
