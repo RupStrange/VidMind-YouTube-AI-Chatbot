@@ -13,8 +13,13 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_classic.memory import ConversationSummaryBufferMemory
 from urllib.parse import urlparse, parse_qs
 import warnings
+
+# Load environment variables before any Streamlit command
+load_dotenv()
+
 os.environ["TRANSFORMERS_NO_TORCHVISION"] = "1"
 warnings.filterwarnings("ignore")
+
 import nltk
 nltk.download('punkt', quiet=True)
 nltk.download('punkt_tab', quiet=True)
@@ -26,14 +31,12 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-load_dotenv()
-
 # ── CACHED RESOURCES ───────────────────────────────────────────────────────────
 
 @st.cache_resource
 def get_model():
     return ChatGroq(
-        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        model="meta-llama/llama-4-scout-17b-16e-instruct",  # Verify on Groq's console
         api_key=os.getenv("GROQ_API_KEY")
     )
 
@@ -311,15 +314,40 @@ else:
         read_time = max(1, st.session_state.word_count // 200)
         m4.metric("⏱️ Est. Read Time", f"{read_time} min")
 
-    # ── CHAT TAB ───────────────────────────────────────────────────────────────
+    # ── CHAT TAB (FIXED DUPLICATION) ───────────────────────────────────────────
 
     with tab_chat:
-        # Guard: memory must exist before building the chain
+        # Guard: memory must exist
         if st.session_state.memory is None:
-            st.warning("⚠️ Something went wrong — memory is not initialized. Please re-analyze the video.")
+            st.warning("⚠️ Memory not initialized. Please re-analyze the video.")
             st.stop()
 
-        system_prompt = """You are VidMind, an expert analyst assistant for YouTube video transcripts.
+        st.subheader("💬 Chat with the video")
+
+        # Display all messages from session state (single source of truth)
+        for msg in st.session_state.messages:
+            avatar = "🧑" if msg["role"] == "user" else "🤖"
+            with st.chat_message(msg["role"], avatar=avatar):
+                st.markdown(msg["content"])
+
+        if not st.session_state.messages:
+            st.info("👋 Welcome! Ask me anything about the video — I'm ready to help. 🤖✨")
+
+        # Chat input at the bottom
+        if prompt := st.chat_input("💬 Ask anything about the video…"):
+            # Add user message
+            st.session_state.messages.append({"role": "user", "content": prompt})
+
+            # Build the chain inside the interaction block (safe and fresh)
+            def format_docs(docs):
+                return "\n\n".join(d.page_content for d in docs)
+
+            def history_load(_):
+                if st.session_state.memory:
+                    return st.session_state.memory.load_memory_variables({}).get("history", [])
+                return []
+
+            system_prompt = """You are VidMind, an expert analyst assistant for YouTube video transcripts.
 
 Your behavior:
 - Answer ONLY based on the provided video context
@@ -332,63 +360,34 @@ Your behavior:
 Context: {context}
 """
 
-        def format_docs(docs):
-            return "\n\n".join(d.page_content for d in docs)
+            prompt_template = ChatPromptTemplate.from_messages([
+                ("system", system_prompt),
+                MessagesPlaceholder(variable_name="history"),
+                ("human", "{question}")
+            ])
 
-        # Capture memory and retriever into local variables to avoid thread issues
-        _memory = st.session_state.memory
-        _retriever = st.session_state.retriever
+            rag_chain = (
+                {
+                    "context": st.session_state.retriever | format_docs,
+                    "question": RunnablePassthrough(),
+                    "history": history_load,
+                }
+                | prompt_template
+                | model
+                | parser
+            )
 
-        def history_load(_):
-            if _memory:
-                return _memory.load_memory_variables({})["history"]
-            return []
+            with st.spinner("🧠 Thinking…"):
+                response = rag_chain.invoke(prompt)
+                if st.session_state.memory:
+                    st.session_state.memory.save_context(
+                        {"input": prompt}, {"output": response}
+                    )
 
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system_prompt),
-            MessagesPlaceholder(variable_name="history"),
-            ("human", "{question}")
-        ])
-
-        rag_chain = (
-            {
-                "context": _retriever | format_docs,
-                "question": RunnablePassthrough(),
-                "history": history_load,
-            }
-            | prompt | model | parser
-        )
-
-        # ── Chat input rendered FIRST — Streamlit pins it to viewport bottom ──
-        user_input = st.chat_input("💬 Ask anything about the video…")
-
-        # ── Scrollable container holds all messages above the input ──────────
-        chat_container = st.container(height=500)
-        with chat_container:
-            if not st.session_state.messages:
-                st.info("👋 Welcome! 🎬 Ask me anything about the video — I'm ready to help. 🤖✨")
-            else:
-                for msg in st.session_state.messages:
-                    avatar = "🧑" if msg["role"] == "user" else "🤖"
-                    with st.chat_message(msg["role"], avatar=avatar):
-                        st.markdown(msg["content"])
-
-        # ── Handle new input ─────────────────────────────────────────────────
-        if user_input:
-            st.session_state.messages.append({"role": "user", "content": user_input})
-            with chat_container:
-                with st.chat_message("user", avatar="🧑"):
-                    st.markdown(user_input)
-                with st.chat_message("assistant", avatar="🤖"):
-                    with st.spinner("🧠 Thinking…"):
-                        response = rag_chain.invoke(user_input)
-                        if _memory:
-                            _memory.save_context(
-                                {"input": user_input}, {"output": response}
-                            )
-                    st.markdown(response)
             st.session_state.messages.append({"role": "assistant", "content": response})
+            st.rerun()
 
+        # Clear chat & export buttons
         if st.session_state.messages:
             st.divider()
             cc1, cc2 = st.columns([1, 5])
