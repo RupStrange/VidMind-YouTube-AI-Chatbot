@@ -1,6 +1,7 @@
 import os
 import re
 import streamlit as st
+from dotenv import load_dotenv
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 from langchain_text_splitters import RecursiveCharacterTextSplitter, NLTKTextSplitter
@@ -9,7 +10,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain.memory import ConversationSummaryBufferMemory
+from langchain_classic.memory import ConversationSummaryBufferMemory
 from urllib.parse import urlparse, parse_qs
 import warnings
 warnings.filterwarnings("ignore")
@@ -24,13 +25,15 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+load_dotenv()
+
 # ── CACHED RESOURCES ───────────────────────────────────────────────────────────
 
 @st.cache_resource
 def get_model():
     return ChatGroq(
         model="meta-llama/llama-4-scout-17b-16e-instruct",
-        api_key=st.secrets["GROQ_API_KEY"]
+        api_key=os.getenv("GROQ_API_KEY")
     )
 
 @st.cache_resource
@@ -209,4 +212,262 @@ if analyze_clicked and url_input:
 
         with st.status("⚙️ Processing video…", expanded=True) as status:
             st.write("📥 Fetching transcript…")
-            transcript_list, lang_code = transcripts_fe
+            transcript_list, lang_code = transcripts_fetch(video_id)
+            st.session_state.lang_code = lang_code
+
+            if not transcript_list:
+                msgs = {
+                    "disabled": "🚫 Transcripts are disabled for this video.",
+                    "error": "💥 An error occurred while fetching transcripts.",
+                    "unknown": "🤷 No transcripts could be found.",
+                }
+                status.update(label="❌ Failed", state="error")
+                st.error(msgs.get(lang_code, "❌ No transcripts found."))
+            else:
+                st.write(f"✅ Transcript fetched ({lang_code.upper()}) 🌐")
+                st.write("🔄 Preprocessing & translating…")
+                translated = preprocess(transcript_list, lang_code)
+                st.session_state.translated = translated
+                st.session_state.word_count = len(translated.split())
+                st.session_state.char_count = len(translated)
+
+                st.write("📝 Generating summary… ✨")
+                st.session_state.summary = generate_summary(translated)
+
+                st.write("🔍 Building knowledge base… 🧠")
+                st.session_state.retriever = build_rag(translated)
+                st.session_state.memory = ConversationSummaryBufferMemory(
+                    llm=model, max_token_limit=1000, return_messages=True
+                )
+                st.session_state.messages = []
+                st.session_state.processed = True
+                status.update(label="✅ Ready to explore! 🚀", state="complete", expanded=False)
+        st.rerun()
+
+# ── MAIN CONTENT ───────────────────────────────────────────────────────────────
+
+if not st.session_state.processed:
+    st.title("🎬 Welcome to VidMind")
+    st.markdown("**✨ Turn any YouTube video into a conversation.** 🔗 Paste a URL in the sidebar to get started.")
+    st.divider()
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.info("### 🎯 Smart Summary\n✅ Get a concise, fact-based summary of any YouTube video — no fluff, just substance.")
+    with c2:
+        st.success("### 💬 Chat with Video\n🤖 Ask questions and get context-aware answers drawn directly from the video content.")
+    with c3:
+        st.warning("### 🌐 Multi-Language\n🗺️ Automatic transcript detection and translation across 15+ languages.")
+
+    st.divider()
+    st.markdown("#### 🚀 Works great with")
+    eg1, eg2, eg3, eg4 = st.columns(4)
+    eg1.markdown("🎓 Lectures & Tutorials")
+    eg2.markdown("📰 News & Documentaries")
+    eg3.markdown("💡 Tech Talks & Podcasts")
+    eg4.markdown("🏋️ Fitness & How-To Guides")
+
+else:
+    hcol1, hcol2 = st.columns([3, 1])
+    with hcol1:
+        st.title(f"🎬 {st.session_state.video_title}")
+        st.caption(f"by {st.session_state.video_author}  ·  {st.session_state.word_count:,} words  ·  {st.session_state.lang_code.upper()}")
+    with hcol2:
+        vid = st.session_state.video_id
+        st.link_button("▶️ Watch on YouTube", f"https://youtube.com/watch?v={vid}", use_container_width=True)
+
+    st.divider()
+
+    tab_summary, tab_chat, tab_transcript = st.tabs(["📋 Summary", "💬 Chat", "📄 Transcript"])
+
+    # ── SUMMARY TAB ────────────────────────────────────────────────────────────
+
+    with tab_summary:
+        st.subheader("📋 AI-Generated Summary ✨")
+        st.info(st.session_state.summary)
+
+        sc1, sc2, sc3 = st.columns([1, 1, 2])
+        with sc1:
+            st.download_button(
+                "⬇️ Download Summary",
+                data=st.session_state.summary,
+                file_name="summary.txt",
+                mime="text/plain",
+                use_container_width=True
+            )
+        with sc2:
+            if st.button("🔁 Regenerate ✨", use_container_width=True):
+                with st.spinner("🔄 Regenerating summary…"):
+                    st.session_state.summary = generate_summary(st.session_state.translated)
+                st.rerun()
+
+        st.divider()
+        st.subheader("📊 Video Stats")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("📝 Words", f"{st.session_state.word_count:,}")
+        m2.metric("🔤 Characters", f"{st.session_state.char_count:,}")
+        m3.metric("🌐 Language", st.session_state.lang_code.upper())
+        read_time = max(1, st.session_state.word_count // 200)
+        m4.metric("⏱️ Est. Read Time", f"{read_time} min")
+
+    # ── CHAT TAB ───────────────────────────────────────────────────────────────
+
+    with tab_chat:
+        # Guard: memory must exist before building the chain
+        if st.session_state.memory is None:
+            st.warning("⚠️ Something went wrong — memory is not initialized. Please re-analyze the video.")
+            st.stop()
+
+        system_prompt = """You are VidMind, an expert analyst assistant for YouTube video transcripts.
+
+Your behavior:
+- Answer ONLY based on the provided video context
+- If something wasn't in the video, say: "This wasn't covered in the video."
+- If asked within the topic but not in context, you may elaborate slightly
+- Never give one-word answers; always be thorough and helpful
+- Remember prior conversation turns and refer to them when relevant
+- Greet warmly if greeted; introduce yourself as VidMind
+
+Context: {context}
+"""
+
+        def format_docs(docs):
+            return "\n\n".join(d.page_content for d in docs)
+
+        # Capture memory and retriever into local variables to avoid thread issues
+        _memory = st.session_state.memory
+        _retriever = st.session_state.retriever
+
+        def history_load(_):
+            if _memory:
+                return _memory.load_memory_variables({})["history"]
+            return []
+
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            MessagesPlaceholder(variable_name="history"),
+            ("human", "{question}")
+        ])
+
+        rag_chain = (
+            {
+                "context": _retriever | format_docs,
+                "question": RunnablePassthrough(),
+                "history": history_load,
+            }
+            | prompt | model | parser
+        )
+
+        # ── Chat input rendered FIRST — Streamlit pins it to viewport bottom ──
+        user_input = st.chat_input("💬 Ask anything about the video…")
+
+        # ── Scrollable container holds all messages above the input ──────────
+        chat_container = st.container(height=500)
+        with chat_container:
+            if not st.session_state.messages:
+                st.info("👋 Welcome! 🎬 Ask me anything about the video — I'm ready to help. 🤖✨")
+            else:
+                for msg in st.session_state.messages:
+                    avatar = "🧑" if msg["role"] == "user" else "🤖"
+                    with st.chat_message(msg["role"], avatar=avatar):
+                        st.markdown(msg["content"])
+
+        # ── Handle new input ─────────────────────────────────────────────────
+        if user_input:
+            st.session_state.messages.append({"role": "user", "content": user_input})
+            with chat_container:
+                with st.chat_message("user", avatar="🧑"):
+                    st.markdown(user_input)
+                with st.chat_message("assistant", avatar="🤖"):
+                    with st.spinner("🧠 Thinking…"):
+                        response = rag_chain.invoke(user_input)
+                        if _memory:
+                            _memory.save_context(
+                                {"input": user_input}, {"output": response}
+                            )
+                    st.markdown(response)
+            st.session_state.messages.append({"role": "assistant", "content": response})
+
+        if st.session_state.messages:
+            st.divider()
+            cc1, cc2 = st.columns([1, 5])
+            with cc1:
+                if st.button("🗑️ Clear Chat"):
+                    st.session_state.messages = []
+                    if st.session_state.memory:
+                        st.session_state.memory.clear()
+                    st.rerun()
+            with cc2:
+                chat_export = "\n\n".join(
+                    f"{'🧑 You' if m['role']=='user' else '🤖 VidMind'}: {m['content']}"
+                    for m in st.session_state.messages
+                )
+                st.download_button(
+                    "⬇️ Export Chat 💾",
+                    data=chat_export,
+                    file_name="chat_export.txt",
+                    mime="text/plain"
+                )
+
+    # ── TRANSCRIPT TAB ─────────────────────────────────────────────────────────
+
+    with tab_transcript:
+        st.subheader("📄 Processed Transcript 🌐")
+        st.caption("🧹 Cleaned and translated transcript used for analysis.")
+
+        search_term = st.text_input("🔍 Search transcript", placeholder="🔎 Type a keyword…")
+        transcript = st.session_state.translated
+
+        if search_term:
+            count = transcript.lower().count(search_term.lower())
+            st.caption(f"🎯 Found **{count}** occurrence(s) of '{search_term}'")
+            parts = transcript.split(". ")
+            hits = [p for p in parts if search_term.lower() in p.lower()]
+            if hits:
+                st.success("✅ **Matching sentences:**")
+                for h in hits[:20]:
+                    st.markdown(f"• {h.strip()}.")
+            else:
+                st.warning("🤷 No matching sentences found.")
+            st.divider()
+
+        with st.expander("📖 View full transcript", expanded=False):
+            st.text_area(
+                label="Full transcript",
+                value=transcript,
+                height=400,
+                label_visibility="collapsed"
+            )
+
+        st.download_button(
+            "⬇️ Download Full Transcript 📄",
+            data=transcript,
+            file_name="transcript.txt",
+            mime="text/plain",
+        )
+
+        st.divider()
+        st.subheader("📦 Export Everything 🚀")
+        full_export = f"""VidMind Export
+==============
+Video: {st.session_state.video_title}
+Channel: {st.session_state.video_author}
+Language: {st.session_state.lang_code.upper()}
+Word Count: {st.session_state.word_count:,}
+
+SUMMARY
+-------
+{st.session_state.summary}
+
+FULL TRANSCRIPT
+---------------
+{st.session_state.translated}
+"""
+        st.download_button(
+            "📦 Download Full Report (Summary + Transcript)",
+            data=full_export,
+            file_name="vidmind_report.txt",
+            mime="text/plain",
+            use_container_width=True,
+            type="primary"
+        )
