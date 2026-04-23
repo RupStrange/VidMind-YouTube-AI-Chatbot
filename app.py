@@ -9,7 +9,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_classic.memory import ConversationSummaryBufferMemory
+from langchain.memory import ConversationSummaryBufferMemory
 from urllib.parse import urlparse, parse_qs
 import warnings
 warnings.filterwarnings("ignore")
