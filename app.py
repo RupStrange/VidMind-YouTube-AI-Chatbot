@@ -1,30 +1,18 @@
 import os
 import re
-import time
 import streamlit as st
-from dotenv import load_dotenv
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
-from langchain_text_splitters import RecursiveCharacterTextSplitter, NLTKTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_classic.memory import ConversationSummaryBufferMemory
+from langchain.memory import ConversationSummaryBufferMemory
 from urllib.parse import urlparse, parse_qs
 import warnings
-
-# Load environment variables before any Streamlit command
-load_dotenv()
-
-os.environ["TRANSFORMERS_NO_TORCHVISION"] = "1"
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
-
-import nltk
-nltk.download('punkt', quiet=True)
-nltk.download('punkt_tab', quiet=True)
+warnings.filterwarnings("ignore")
 
 st.set_page_config(
     page_title="VidMind · YouTube AI Analyst",
@@ -37,19 +25,10 @@ st.set_page_config(
 
 @st.cache_resource
 def get_model():
-    # Use a widely‑available Groq model as fallback if the original is not found.
-    models_to_try = [
-        "llama-3.1-70b-versatile",          # very reliable
-        "meta-llama/llama-4-scout-17b-16e-instruct",  # original (if still valid)
-        "mixtral-8x7b-32768",
-    ]
-    for model_name in models_to_try:
-        try:
-            return ChatGroq(model=model_name, api_key=os.getenv("GROQ_API_KEY"))
-        except Exception:
-            continue
-    # If none work, the last attempt will raise an exception that will be caught at startup
-    return ChatGroq(model=models_to_try[-1], api_key=os.getenv("GROQ_API_KEY"))
+    return ChatGroq(
+        model="meta-llama/llama-4-scout-17b-16e-instruct",
+        api_key=st.secrets["GROQ_API_KEY"]
+    )
 
 @st.cache_resource
 def get_embeddings():
@@ -81,59 +60,24 @@ def get_video_meta(video_id):
         return "YouTube Video", "Unknown"
 
 def transcripts_fetch(video_id):
-    """
-    Fetch transcripts with a timeout to avoid hanging.
-    Returns: (list of snippet dicts, language_code or status)
-    """
     preferred = ["en", "hi", "bn", "ar", "zh", "fr", "de", "es"]
     if not video_id:
         return [], "unknown"
-
-    # Helper to attempt fetching a transcript with timeout
-    def try_fetch_transcript(transcript):
-        try:
-            # The fetch() call itself doesn't support timeout, so we wrap it
-            # in a thread with timeout (simple approach with time.sleep is not ideal,
-            # but we can use youtube_transcript_api's built-in proxy parameter?).
-            # Instead, we'll use the requests timeout via the API's http client.
-            # Unfortunately the library doesn't expose that; we'll add a crude
-            # wrapper using threading. But to keep it simple, we catch all exceptions.
-            return transcript.fetch()  # No timeout – we handle with a short overall timeout
-        except Exception:
-            return None
-
     try:
-        # Get the transcript list object
-        try:
-            transcript_list = YouTubeTranscriptApi().list(video_id)
-        except TranscriptsDisabled:
-            return [], "disabled"
-        except Exception:
-            return [], "error"
-
-        # Try preferred languages
         for lang in preferred:
             try:
-                transcript = transcript_list.find_transcript([lang])
-                # Attempt fetch – we can't easily set timeout, but we'll catch
-                fetched = transcript.fetch()
-                if fetched:
-                    return fetched, lang
+                tl = YouTubeTranscriptApi().list(video_id).find_transcript([lang]).fetch()
+                return tl, lang
             except NoTranscriptFound:
                 continue
-            except Exception:
-                continue
-
-        # Fallback: try any available transcript
-        for transcript in transcript_list:
+        for transcript in YouTubeTranscriptApi().list(video_id):
             try:
-                fetched = transcript.fetch()
-                if fetched:
-                    return fetched, transcript.language_code
+                return transcript.fetch(), transcript.language_code
             except Exception:
                 continue
-
         return [], "unknown"
+    except TranscriptsDisabled:
+        return [], "disabled"
     except Exception:
         return [], "error"
 
@@ -141,7 +85,7 @@ def translation(transcript_list, language_code):
     full_text = " ".join(snippet.text for snippet in transcript_list)
     if language_code == "en":
         return full_text
-    chunks = NLTKTextSplitter(chunk_size=1000, chunk_overlap=200).split_text(full_text)
+    chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_text(full_text)
     prompt_translate = PromptTemplate(
         template="You are an expert translator. Translate from {language_code} to English.\nOutput ONLY the translated text.\ntext: {snippet}",
         input_variables=["language_code", "snippet"]
@@ -150,11 +94,7 @@ def translation(transcript_list, language_code):
     translated = []
     prog = st.progress(0, text="Translating transcript…")
     for i, chunk in enumerate(chunks):
-        try:
-            translated.append(chain.invoke({"language_code": language_code, "snippet": chunk}))
-        except Exception as e:
-            st.error(f"Translation failed at chunk {i+1}: {str(e)[:200]}")
-            translated.append(chunk)  # fallback to original chunk
+        translated.append(chain.invoke({"language_code": language_code, "snippet": chunk}))
         prog.progress((i + 1) / len(chunks), text=f"Translating… {i+1}/{len(chunks)}")
     prog.empty()
     return " ".join(translated)
@@ -171,11 +111,7 @@ def facts_extract(translated: str):
     )
     facts, prog = [], st.progress(0, text="Extracting facts…")
     for i, doc in enumerate(docs):
-        try:
-            facts.append((fact_prompt | model | parser).invoke(doc.page_content))
-        except Exception as e:
-            st.error(f"Fact extraction failed at chunk {i+1}: {str(e)[:200]}")
-            facts.append(doc.page_content)  # use raw text as fallback
+        facts.append((fact_prompt | model | parser).invoke(doc.page_content))
         prog.progress((i + 1) / len(docs), text=f"Extracting facts… {i+1}/{len(docs)}")
     prog.empty()
     return "\n".join(facts)
@@ -186,14 +122,10 @@ def generate_summary(translated: str):
         input_variables=["facts"],
         template="Write a concise summary (max 500 words) using ONLY these facts. Chronological order, no new info.\n\n{facts}\n\nFinal Summary:"
     )
-    try:
-        return (RunnableLambda(lambda x: {"facts": x}) | final_prompt | model | parser).invoke(facts)
-    except Exception as e:
-        st.error(f"Summary generation failed: {str(e)[:200]}")
-        return facts  # fallback: just return the facts
+    return (RunnableLambda(lambda x: {"facts": x}) | final_prompt | model | parser).invoke(facts)
 
 def build_rag(translated: str):
-    docs = NLTKTextSplitter(chunk_size=1000, chunk_overlap=200).create_documents([translated])
+    docs = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).create_documents([translated])
     vs = FAISS.from_documents(documents=docs, embedding=get_embeddings())
     return vs.as_retriever(search_type="mmr", search_kwargs={"k": 4, "fetch_k": 20, "lambda_mult": 0.5})
 
@@ -280,32 +212,21 @@ if analyze_clicked and url_input:
             if not transcript_list:
                 msgs = {
                     "disabled": "🚫 Transcripts are disabled for this video.",
-                    "error": "💥 An error occurred while fetching transcripts (check network or video availability).",
+                    "error": "💥 An error occurred while fetching transcripts.",
                     "unknown": "🤷 No transcripts could be found.",
                 }
                 status.update(label="❌ Failed", state="error")
                 st.error(msgs.get(lang_code, "❌ No transcripts found."))
-                st.stop()  # Stop here, don't rerun or continue
             else:
                 st.write(f"✅ Transcript fetched ({lang_code.upper()}) 🌐")
                 st.write("🔄 Preprocessing & translating…")
-                try:
-                    translated = preprocess(transcript_list, lang_code)
-                except Exception as e:
-                    status.update(label="❌ Translation error", state="error")
-                    st.error(f"Translation error: {str(e)[:300]}")
-                    st.stop()
+                translated = preprocess(transcript_list, lang_code)
                 st.session_state.translated = translated
                 st.session_state.word_count = len(translated.split())
                 st.session_state.char_count = len(translated)
 
                 st.write("📝 Generating summary… ✨")
-                try:
-                    st.session_state.summary = generate_summary(translated)
-                except Exception as e:
-                    status.update(label="❌ Summary error", state="error")
-                    st.error(f"Summary creation error: {str(e)[:300]}")
-                    st.stop()
+                st.session_state.summary = generate_summary(translated)
 
                 st.write("🔍 Building knowledge base… 🧠")
                 st.session_state.retriever = build_rag(translated)
@@ -315,8 +236,6 @@ if analyze_clicked and url_input:
                 st.session_state.messages = []
                 st.session_state.processed = True
                 status.update(label="✅ Ready to explore! 🚀", state="complete", expanded=False)
-                # Delay slightly for the user to see the completion
-                time.sleep(0.5)
         st.rerun()
 
 # ── MAIN CONTENT ───────────────────────────────────────────────────────────────
@@ -385,35 +304,14 @@ else:
         read_time = max(1, st.session_state.word_count // 200)
         m4.metric("⏱️ Est. Read Time", f"{read_time} min")
 
-    # ── CHAT TAB (FIXED DUPLICATION) ───────────────────────────────────────────
+    # ── CHAT TAB ───────────────────────────────────────────────────────────────
 
     with tab_chat:
         if st.session_state.memory is None:
-            st.warning("⚠️ Memory not initialized. Please re-analyze the video.")
+            st.warning("⚠️ Something went wrong — memory is not initialized. Please re-analyze the video.")
             st.stop()
 
-        st.subheader("💬 Chat with the video")
-
-        for msg in st.session_state.messages:
-            avatar = "🧑" if msg["role"] == "user" else "🤖"
-            with st.chat_message(msg["role"], avatar=avatar):
-                st.markdown(msg["content"])
-
-        if not st.session_state.messages:
-            st.info("👋 Welcome! Ask me anything about the video — I'm ready to help. 🤖✨")
-
-        if prompt := st.chat_input("💬 Ask anything about the video…"):
-            st.session_state.messages.append({"role": "user", "content": prompt})
-
-            def format_docs(docs):
-                return "\n\n".join(d.page_content for d in docs)
-
-            def history_load(_):
-                if st.session_state.memory:
-                    return st.session_state.memory.load_memory_variables({}).get("history", [])
-                return []
-
-            system_prompt = """You are VidMind, an expert analyst assistant for YouTube video transcripts.
+        system_prompt = """You are VidMind, an expert analyst assistant for YouTube video transcripts.
 
 Your behavior:
 - Answer ONLY based on the provided video context
@@ -426,36 +324,58 @@ Your behavior:
 Context: {context}
 """
 
-            prompt_template = ChatPromptTemplate.from_messages([
-                ("system", system_prompt),
-                MessagesPlaceholder(variable_name="history"),
-                ("human", "{question}")
-            ])
+        def format_docs(docs):
+            return "\n\n".join(d.page_content for d in docs)
 
-            rag_chain = (
-                {
-                    "context": st.session_state.retriever | format_docs,
-                    "question": RunnablePassthrough(),
-                    "history": history_load,
-                }
-                | prompt_template
-                | model
-                | parser
-            )
+        _memory = st.session_state.memory
+        _retriever = st.session_state.retriever
 
-            with st.spinner("🧠 Thinking…"):
-                try:
-                    response = rag_chain.invoke(prompt)
-                    if st.session_state.memory:
-                        st.session_state.memory.save_context(
-                            {"input": prompt}, {"output": response}
-                        )
-                except Exception as e:
-                    response = f"⚠️ An error occurred: {str(e)[:200]}"
-                    st.error(response)
+        def history_load(_):
+            if _memory:
+                return _memory.load_memory_variables({})["history"]
+            return []
 
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system_prompt),
+            MessagesPlaceholder(variable_name="history"),
+            ("human", "{question}")
+        ])
+
+        rag_chain = (
+            {
+                "context": _retriever | format_docs,
+                "question": RunnablePassthrough(),
+                "history": history_load,
+            }
+            | prompt | model | parser
+        )
+
+        user_input = st.chat_input("💬 Ask anything about the video…")
+
+        chat_container = st.container(height=500)
+        with chat_container:
+            if not st.session_state.messages:
+                st.info("👋 Welcome! 🎬 Ask me anything about the video — I'm ready to help. 🤖✨")
+            else:
+                for msg in st.session_state.messages:
+                    avatar = "🧑" if msg["role"] == "user" else "🤖"
+                    with st.chat_message(msg["role"], avatar=avatar):
+                        st.markdown(msg["content"])
+
+        if user_input:
+            st.session_state.messages.append({"role": "user", "content": user_input})
+            with chat_container:
+                with st.chat_message("user", avatar="🧑"):
+                    st.markdown(user_input)
+                with st.chat_message("assistant", avatar="🤖"):
+                    with st.spinner("🧠 Thinking…"):
+                        response = rag_chain.invoke(user_input)
+                        if _memory:
+                            _memory.save_context(
+                                {"input": user_input}, {"output": response}
+                            )
+                    st.markdown(response)
             st.session_state.messages.append({"role": "assistant", "content": response})
-            st.rerun()
 
         if st.session_state.messages:
             st.divider()
