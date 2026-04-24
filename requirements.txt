@@ -1,5 +1,5 @@
 streamlit
-python-dotenv
+langchain
 langchain-core
 langchain-community
 langchain-text-splitters
@@ -7,8 +7,5 @@ langchain-huggingface
 langchain-groq
 langchain-classic
 youtube-transcript-api
-nltk
 faiss-cpu
 sentence-transformers
-torch
-transformers
